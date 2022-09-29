@@ -1,0 +1,1 @@
+{"source":"stdout","log":"{\"method\":\"GET\",\"path\":\"/sre/boshuchu\",\"format\":\"html\",\"controller\":\"SRE::BoshuchuController\",\"action\":\"show\",\"status\":200,\"duration\":25.11,\"view\":0.73,\"level\":\"info\",\"user_id\":null,\"ip\":null,\"referer\":null,\"user_agent\":null,\"time\":\"2022-09-22T18:21:19+09:00\",\"params\":{}}"}
