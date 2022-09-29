@@ -1,0 +1,106 @@
+name: test_fluentbit
+
+on:
+  push:
+
+jobs:
+  test_fluentbit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v3
+
+      # テスト用イメージビルド
+      - name: Cache Docker layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ${{ github.ref }}-${{ github.sha }}
+            ${{ github.ref }}
+            refs/head/main
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v1
+      - name: Build a Docker image for testing
+        uses: docker/build-push-action@v3
+        with:
+          context: ./
+          builder: ${{ steps.buildx.outputs.name }}
+          push: false
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache
+          outputs: type=docker # GitHub Actions 上のローカルに build し、以降 step でイメージを参照できる様にする
+          tags: test-fluentbit:latest
+
+      - name: fluentbit 設定ファイル構文チェック
+        run: >
+          docker run --rm
+          -e DELIVERY_STREAM=dummy
+          -e DELIVERY_STREAM_EVENT_LOG=dummy
+          test-fluentbit:latest
+          /fluent-bit/bin/fluent-bit -c /fluent-bit/etc/extra.conf --dry-run
+
+      - name: fluentbit コンテナへ外部から http 経由でアクセスすべく、docker network を作成
+        run: docker network create actions
+
+      # テスト用 fluentbit コンテナ起動
+      # 以降、このテスト用 fluentbit コンテナを利用しテストを実施する
+      - name: run fluentbit for testing
+        run: >
+          docker run --rm -d
+          --name fluentbit
+          --network actions
+          -v /tmp:/tmp
+          -v $(pwd)/test/output.conf:/fluent-bit/etc/output.conf
+          -v $(pwd)/test/test.conf:/fluent-bit/etc/test.conf
+          test-fluentbit:latest
+          /fluent-bit/bin/fluent-bit -c /fluent-bit/etc/test.conf
+
+      # NOTE: http://fluentbit:9880/web-firelens-dummy に対して curl することで
+      #       tag=web-firelens-dummy を付与したログを fluentbit に POST できる。
+      - name: fluentbit コンテナへ Rails コンテナログを http 経由で POST する
+        run: >
+          docker run --rm
+          --network actions
+          --link fluentbit:fluentbit
+          -v $(pwd)/test/web_container.log:/tmp/web_container.log
+          curlimages/curl:latest -v -d @/tmp/web_container.log -XPOST -H "content-type: application/json"
+          http://fluentbit:9880/web-firelens-dummy
+      - name: コンテナログファイルが生成されるまで待機する。生成されない場合、テスト失敗となる
+        # NOTE: web-firelens-dummy タグでリクエストすると web_firelens_dummy というファイル名で生成される
+        run: while [ ! -e /tmp/web_firelens_dummy ]; do sleep 1; done
+      - name: Rails コンテナログが改変されず出力されること。実値と予測値が一致しない場合、テスト失敗とし異常終了する
+        # NOTE: fluentbit 経由で出力されるログの JSON のキーは毎回順不同な為、 `--sort-keys` でキーを昇順にソートしています。
+        run: |
+          diff -q \
+          <(sed 's|web_firelens_dummy: ||g' /tmp/web_firelens_dummy | jq -r --sort-keys '.[1]') \
+          <(cat ./test/web_container.log | jq --sort-keys .)
+
+      # NOTE: http://fluentbit:9880/eventlog に対して curl することで
+      #       tag=eventlog を付与したログを fluentbit に POST できる。
+      - name: fluentbit コンテナへ lograge で JSON フォーマットされた Rails ログでないログを http 経由で POST する
+        run: >
+          docker run --rm
+          --network actions
+          --link fluentbit:fluentbit
+          -v $(pwd)/test/no_target_event.log:/tmp/no_target_event.log
+          curlimages/curl:latest -v -d @/tmp/no_target_event.log -XPOST -H "content-type: application/json"
+          http://fluentbit:9880/eventlog
+      - name: ユーザ行動ログが含まれる場合、最低でも 5 秒以内でログファイルが生成される為、5 秒間待機する
+        run: sleep 5
+      - name: ユーザ行動抽出対象でないログである場合、ログファイルが生成されない。生成される場合テスト失敗とし異常終了する
+        run: if [ -e /tmp/eventlog ]; then exit 1; fi
+
+      - name: fluentbit コンテナへ lograge で JSON フォーマットされた Rails ログを http 経由で POST する
+        run: >
+          docker run --rm
+          --network actions
+          --link fluentbit:fluentbit
+          -v $(pwd)/test/event.log:/tmp/event.log
+          curlimages/curl:latest -v -d @/tmp/event.log -XPOST -H "content-type: application/json"
+          http://fluentbit:9880/eventlog
+      - name: ユーザ行動ログファイルで生成されるまで待機する。生成されない場合、テスト失敗となる
+        run: while [ ! -e /tmp/eventlog ]; do sleep 1; done
+      # NOTE: ユーザ行動ログを含むログの場合、 expect filter plugin で抽出ログを検証する為、出力ログファイルの検証はしない
